@@ -1,0 +1,11 @@
+config.json
+claude-settings.json
+*.log
+*.log.*
+*.pid
+__pycache__/
+.claude/
+claude-smoke-result.json
+.workbuddy/
+empty-mcp.json
+test-fixture.txt
