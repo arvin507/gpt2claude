@@ -199,10 +199,45 @@ def translate_request(body, model, effort="low"):
     if not isinstance(system, str):
         raise ProxyError("system must be text or text blocks.")
     items = []
+    notes = []
     for message in body["messages"]:
         role = message.get("role")
+        if role in ("system", "developer"):
+            # Claude Desktop sends mid-conversation system reminders inside
+            # messages, but the Messages schema only allows user/assistant there.
+            # The Codex backend carries system content only as instructions, so
+            # fold the text in rather than dropping guidance the client sent.
+            note = message.get("content", [])
+            if isinstance(note, str):
+                note = [{"type": "text", "text": note}]
+            if not isinstance(note, list):
+                raise ProxyError(f"{role} message content must be text or blocks.")
+            for block in note:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    raise ProxyError(f"Only text {role} blocks are supported.")
+                notes.append(block.get("text", ""))
+            continue
         if role not in ("user", "assistant"):
-            raise ProxyError("Messages must have user or assistant roles.")
+            # Report the shape, never the content: a client is sending a role the
+            # Messages schema does not allow, and the shape is what identifies it.
+            shapes = []
+            for item in body["messages"]:
+                if not isinstance(item, dict):
+                    shapes.append(type(item).__name__)
+                    continue
+                content = item.get("content")
+                blocks = ([b.get("type") for b in content if isinstance(b, dict)]
+                          if isinstance(content, list) else type(content).__name__)
+                shapes.append({"role": item.get("role"), "keys": sorted(item),
+                               "blocks": blocks})
+            try:
+                (ROOT / "role-error-dump.json").write_text(
+                    json.dumps({"request_keys": sorted(body), "messages": shapes},
+                               ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+            raise ProxyError(f"Messages must have user or assistant roles (got {role!r}; "
+                             f"roles seen: {[m.get('role') for m in body['messages'] if isinstance(m, dict)]}).")
         content = message.get("content", [])
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -241,7 +276,9 @@ def translate_request(body, model, effort="low"):
             else:
                 raise ProxyError(f"Unsupported {role} content block: {kind}")
         flush()
-    request = {"model": model, "instructions": system or "You are a helpful assistant.",
+    request = {"model": model,
+               "instructions": "\n\n".join(part for part in (system, *notes) if part)
+                               or "You are a helpful assistant.",
                "input": items, "stream": True, "store": False,
                "reasoning": {"effort": effort}}
     tools = []
@@ -279,9 +316,23 @@ def translate_request(body, model, effort="low"):
 def resolve_options(body, config):
     requested = body.get("model") or config["model"]
     models = config.get("models", [config["model"]])
+    # Claude Desktop appends a context variant suffix such as "[1m]" to the id it
+    # picked; the suffix is presentation only, the upstream model is unchanged.
+    if "[" in requested:
+        requested = requested.split("[", 1)[0]
     aliases = {"sonnet": models[0], "haiku": models[0], "opus": models[-1],
                "claude-sonnet-4-5": models[0], "claude-opus-4-5": models[-1]}
-    model = aliases.get(requested, requested)
+    if requested in aliases:
+        model = aliases[requested]
+    elif requested in models:
+        model = requested
+    elif requested.startswith("claude-"):
+        # Claude Desktop catalogue ids (claude-opus-5-5, claude-sonnet-5-5, and the
+        # other families its model picker knows). Route by family name.
+        family = requested.split("-")[1] if requested.count("-") >= 1 else ""
+        model = models[-1] if family in {"opus", "fable"} else models[0]
+    else:
+        model = requested
     if model not in models:
         raise ProxyError("Unknown model. Select a model listed by /v1/models.")
     effort = (body.get("output_config") or {}).get("effort", config["reasoning_effort"])
@@ -597,28 +648,34 @@ class Handler(BaseHTTPRequestHandler):
                                      "upstream_model": self.server.config["model"]})
         elif path == "/v1/models" and self.authorized():
             model = self.server.config["model"]
-            # Desktop discovery filters out non-Claude IDs. This is a routing alias,
-            # clearly labelled with the real upstream, not a claim to serve Claude.
-            alias = "claude-sonnet-4-5"
-            models = [
-                {"id": alias, "type": "model", "display_name": f"GPT subscription — {model}",
-                 "description": f"Local compatibility alias. Actual upstream: {model} (OpenAI subscription).",
-                 "created_at": "2026-01-01T00:00:00Z",
-                 "anthropic_family_tier": "sonnet", "is_family_default": True},
-                {"id": model, "type": "model", "display_name": model,
-                 "created_at": "2026-01-01T00:00:00Z"},
-            ]
             configured = self.server.config.get("models", [model])
-            models += [{"id": name, "type": "model", "display_name": name,
-                        "created_at": "2026-01-01T00:00:00Z"} for name in configured if name != model]
+            # Claude Desktop looks each advertised id up in its own signed model
+            # catalogue (model-catalog/published.json) to learn the context window
+            # and the available effort levels. An id it does not recognize gets a
+            # fallback budget of 200K and no effort selector at all, so advertise
+            # ids that the catalogue does contain and route them onto our upstream
+            # models. Each entry is labelled with the real upstream in its text.
+            catalogue = [("claude-opus-5-5", configured[-1], "opus"),
+                         ("claude-sonnet-5-5", configured[0], "sonnet")]
             if len(configured) > 1:
-                models.insert(1, {"id": "claude-opus-4-5", "type": "model",
-                                  "display_name": f"GPT subscription — {configured[-1]}",
-                                  "description": f"Compatibility alias. Actual upstream: {configured[-1]}",
-                                  "created_at": "2026-01-01T00:00:00Z"})
-            # Claude Desktop builds these into its model picker; omit them and the
-            # effort selector never renders (max_effort_level -> maxEffort) and the
-            # window budget falls back to a built-in default.
+                catalogue.append(("claude-haiku-5-5", configured[0], "haiku"))
+            models = [{"id": mid, "type": "model",
+                       "display_name": f"{tier.title()} · {upstream}",
+                       "description": f"Served locally by {upstream} on your ChatGPT subscription. "
+                                      f"Listed under this id so Claude Desktop resolves the catalogue metadata.",
+                       "created_at": "2026-01-01T00:00:00Z",
+                       "anthropic_family_tier": tier,
+                       "is_family_default": tier == "sonnet"}
+                      for mid, upstream, tier in catalogue]
+            alias = models[0]["id"]
+            models += [{"id": name, "type": "model",
+                        "display_name": f"{name} (no catalogue metadata)",
+                        "description": f"Raw upstream id. Claude Desktop does not know it, so it shows a "
+                                       f"200K window and no effort selector; prefer the ids above.",
+                        "created_at": "2026-01-01T00:00:00Z"} for name in configured]
+            # max_effort_level becomes maxEffort and caps the catalogue's effort
+            # list; max_input_tokens is informational only, because the window is
+            # taken from the catalogue entry rather than from this payload.
             effort_level = self.server.config.get("max_effort_level", "xhigh")
             context = int(self.server.config["context_window"])
             for entry in models:

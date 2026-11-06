@@ -43,6 +43,15 @@ class TranslationTests(unittest.TestCase):
         with self.assertRaises(ProxyError):
             translate_request({"messages": [{"role": "user", "content": [{"type": "document"}]}]}, "gpt-test")
 
+    def test_mid_conversation_system_message_folds_into_instructions(self):
+        # Claude Desktop sends reminders as role "system" inside messages, which
+        # the Messages schema forbids; they must not be dropped.
+        request = translate_request({"system": "Base", "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": [{"type": "text", "text": "Reminder"}]}]}, "gpt-test")
+        self.assertEqual(request["instructions"], "Base\n\nReminder")
+        self.assertEqual([item["role"] for item in request["input"]], ["user"])
+
 
 class StreamTests(unittest.TestCase):
     def test_sse_parser_handles_comments_and_multiline_data(self):
@@ -102,12 +111,23 @@ class ModelOptionsTests(unittest.TestCase):
             with self.assertRaises(ProxyError):
                 proxy.resolve_options(body, config)
 
+    def test_catalogue_ids_route_by_family(self):
+        # Claude Desktop only knows these ids through its signed model catalogue;
+        # it sends them (sometimes with a "[1m]" suffix) once the picker uses them.
+        config = {"model": "gpt-6.1-sol", "models": ["gpt-6.1-sol", "gpt-6.1-terra"], "reasoning_effort": "low"}
+        for name, expected in [("claude-opus-5-5", "gpt-6.1-terra"),
+                               ("claude-sonnet-5-5", "gpt-6.1-sol"),
+                               ("claude-haiku-5-5", "gpt-6.1-sol"),
+                               ("claude-fable-5-1", "gpt-6.1-terra"),
+                               ("claude-opus-5-5[1m]", "gpt-6.1-terra")]:
+            self.assertEqual(proxy.resolve_options({"model": name}, config)[0], expected)
+
 
 class ValidationTests(unittest.TestCase):
     def test_invalid_requests(self):
         base = {"messages": [{"role": "user", "content": "hi"}]}
         invalid = [None, [], {}, {"messages": []}, {"messages": [None]},
-                   {"messages": [{"role": "system", "content": "hi"}]},
+                   {"messages": [{"role": "tool", "content": "hi"}]},
                    {"messages": [{"role": "user", "content": 1}]}]
         for key, values in {
             "stream": [1, "true", None], "max_tokens": [True, 0, -1, 1.5, "2"],

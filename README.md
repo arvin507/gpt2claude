@@ -179,30 +179,48 @@ claude --settings ~/gpt2claude/claude-settings.json            # macOS / Linux
 | --- | --- |
 | `sonnet` / `haiku` / `claude-sonnet-4-5` | `models[0]`（默认 `gpt-6.1-sol`） |
 | `opus` / `claude-opus-4-5` | `models[-1]`（默认 `gpt-6.1-terra`） |
+| `claude-opus-5-5` / `claude-fable-5-1` 等目录 ID | `models[-1]` |
+| `claude-sonnet-5-5` / `claude-haiku-5-5` 等目录 ID | `models[0]` |
 | `gpt-6.1-sol` / `gpt-6.1-terra` | 同名模型 |
 
 `config.json` 的 `models` 是**有序**的：第一个用于 sonnet/haiku，最后一个用于 opus。列表外的 ID 明确拒绝，不会静默回落到默认模型。
 
 ### 桌面 App 模型发现
 
-Claude Desktop 的自动发现会过滤非 Claude 格式的模型 ID，所以代理额外返回 `claude-sonnet-4-5` 作为兼容路由别名，显示名/描述里标注真实的 GPT 模型。它**仍然调用** `config.json` 的 GPT 模型，不会调用 Claude。若 App 按 ID 自行显示成 Sonnet，那也只是这个别名。
+Claude Desktop 的自动发现会过滤非 Claude 格式的模型 ID，所以代理把上游模型挂在 Desktop 认识的 ID 下，显示名/描述里标注真实上游。它**仍然调用** `config.json` 的 GPT 模型，不会调用 Claude。
 
-也可以在第三方推理配置的 **Models** 里手动添加 `gpt-6.1-sol`，用显式列表跳过自动发现 —— 这样模型 ID 和实际模型完全一致。
-
-#### 为什么 App 里看不到思考强度 / 400K 不生效
-
-桌面 App **不读 `claude-settings.json`**，它只从第三方推理配置里拿 `inferenceGatewayBaseUrl` 和 `inferenceApiKey`。所以该文件里的 `ANTHROPIC_DEFAULT_*_MODEL_SUPPORTED_CAPABILITIES`、`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 对 App 全部无效，只对 `claude` 命令生效。
-
-App 对 `/v1/models` 的每个条目按固定 schema 校验，其中两个字段决定上面两个能力：
-
-| 字段 | 作用 | 缺失后果 |
+| 面板里看到的 | 客户端传的 ID | 实际调用 |
 | --- | --- | --- |
-| `max_effort_level` | 映射为 `maxEffort`，是强度选择器的开关 | 选择器**整个不渲染** |
-| `max_input_tokens` | 与 `supports_1m` 一起推断上下文规模 | 回落到内置默认窗口 |
+| `Opus · gpt-6.1-terra` | `claude-opus-5-5` | `models[-1]` |
+| `Sonnet · gpt-6.1-sol` | `claude-sonnet-5-5` | `models[0]` |
+| `Haiku · gpt-6.1-sol` | `claude-haiku-5-5` | `models[0]` |
+| `gpt-6.1-sol` / `gpt-6.1-terra` | 同名 | 同名 |
 
-代理现在会为每个模型条目返回这两个字段（`max_effort_level` 取 `config.json` 的 `max_effort_level`，默认 `xhigh`；`max_input_tokens` 取 `context_window`）。App 侧仍需满足两点：
+任何 `claude-*` 形式的目录 ID 都会被接受（按家族名路由：`opus`/`fable` → `models[-1]`，其余 → `models[0]`），带 `[1m]` 后缀的 ID 会先剥掉后缀。
 
-1. **窗口预算走环境变量。** App 从进程环境读 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，需在系统里设置后再启动 App：
+#### 为什么 App 里看不到思考强度 / 上下文不是 400K
+
+**根因：Desktop 不是从 `/v1/models` 读窗口和强度，而是拿模型 ID 去查它自己的签名模型目录。**
+
+目录在 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Claude-3p\model-catalog\published.json`（`documentBytes` 是 base64 的 JSON，带 RSASSA-PKCS1-v1_5-SHA512 签名，公钥固定在包里，**不能改**）。里面 `surfaces.ccd.model_selector_config[0].models[]` 的每个条目同时给出 `runtime.max_input_tokens` 与 `thinking.effort_options`。
+
+App 的匹配函数（`app.asar` 内 `sCn`）先比对 `provider_ids`，再比对规范化后的 ID：
+
+```js
+let a = kT(e);                                   // 规范化传入的 id
+return t.findIndex(t => oCn(t) && (kT(t.id) === a || aCn(t, n).some(p => kT(p) === a)));
+```
+
+**匹配不到 → 整条元数据都没有**：窗口落到内置默认 200000，`thinking` 为空所以强度选择器不渲染。`behaves_as` 也救不了，因为 `fCn` 要先把条目匹配上才会去读它。
+
+所以此前对外暴露 `claude-opus-4-5` / `claude-sonnet-4-5` 必然是这个结果 —— 目录里只有 `claude-opus-4-6/4-7/4-8/5/5-5` 这些，没有 `4-5`。
+
+顺带纠正一个此前的误判：`/v1/models` 里的 `max_input_tokens` **不会被解析**（`RCn` 只读 `id`、`display_name`、`description`、`max_effort_level`、`behaves_as`、`supports_1m`、`prefer_1m`、`anthropic_family_tier`），返回它只是给别的客户端用。真正起作用的开关是 `max_effort_level`（→ `maxEffort`，用来裁剪强度档位）和**模型 ID 本身**。
+
+现在的做法与配套动作：
+
+1. 代理对外只暴露目录里存在的 ID（上表），元数据因此能从目录命中，强度选择器恢复。
+2. 目录把这类模型声明为 1M 窗口，而上游只有 400K，所以用环境变量把它压回 400K：
 
    ```powershell
    [Environment]::SetEnvironmentVariable('CLAUDE_CODE_MAX_CONTEXT_TOKENS','400000','User')
@@ -212,7 +230,9 @@ App 对 `/v1/models` 的每个条目按固定 schema 校验，其中两个字段
    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=400000
    ```
 
-2. **改完必须完全退出 App 再开**（托盘图标 → Quit，不是关窗口），否则模型清单走缓存。
+   App 启动子 CLI 时会把该变量原样透传（`main.log` 里的 spawn 诊断可见 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 这一项）。
+3. **改完必须完全退出 App 再开**（托盘图标 → Quit，确认没有残留 `claude.exe`），否则模型清单走缓存。
+4. **还要在模型面板里重新选一次模型。** 旧选中项是 `claude-opus-4-5`，代理已不再暴露，继续用它不会带目录元数据。
 
 
 ---

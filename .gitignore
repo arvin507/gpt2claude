@@ -9,3 +9,4 @@ claude-smoke-result.json
 .workbuddy/
 empty-mcp.json
 test-fixture.txt
+role-error-dump.json
